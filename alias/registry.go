@@ -121,8 +121,13 @@ func (r *Registry) Snapshot() []Alias {
 }
 
 // less reports whether alias x sorts before y under the WS-B §3.1 total order:
-// (class_rank, exhaustion_rank, capability_rank, stable_index), all ascending.
-// exhaustion_rank is derived from cooldown against the supplied now.
+// (class_rank, exhaustion_rank, capability_rank, stable_index, name), all
+// ascending. exhaustion_rank is derived from cooldown against the supplied now.
+// Name is the final tie-break: registry names are unique (Register rejects
+// duplicates via ErrDuplicate), so it is a total discriminator that makes the
+// order fully deterministic regardless of map-iteration order (§11.4.50) even
+// when two aliases share all four preceding keys — including StableIndex, whose
+// uniqueness is not enforced at Register.
 func less(x, y Alias, now time.Time) bool {
 	if int(x.Class) != int(y.Class) {
 		return int(x.Class) < int(y.Class)
@@ -134,7 +139,10 @@ func less(x, y Alias, now time.Time) bool {
 	if x.CapabilityRank != y.CapabilityRank {
 		return x.CapabilityRank < y.CapabilityRank
 	}
-	return x.StableIndex < y.StableIndex
+	if x.StableIndex != y.StableIndex {
+		return x.StableIndex < y.StableIndex
+	}
+	return x.Name < y.Name
 }
 
 // exhaustionRank is 0 when the alias is free (cooldown elapsed / unset) and 1
@@ -164,6 +172,9 @@ func SortByPriorityAt(as []Alias, now time.Time) {
 // false) when none is operable — an explicit, honest outcome (WS-B §4.5), never
 // a silent fall-through to an unhealthy alias.
 func (r *Registry) FirstOperable(now time.Time, probe func(Alias) ProbeResult) (string, bool) {
+	if probe == nil {
+		return "", false // no probe → nothing can be proven operable (never a panic)
+	}
 	for _, a := range r.Snapshot() {
 		if IsOperable(a, probe(a), now) {
 			return a.Name, true

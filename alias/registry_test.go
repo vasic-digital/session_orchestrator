@@ -143,3 +143,62 @@ func TestRegistryConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestSnapshotDeterministicTieBreak drives the REAL Register→Snapshot (map-backed)
+// path — not a literal slice — with eight aliases sharing ALL FOUR primary sort
+// keys (class, exhaustion, capability, stableIndex), so ONLY the Name tie-break
+// discriminates them. It asserts Snapshot() yields a byte-identical, name-ascending
+// order across N iterations. Pre-fix (no Name tie-break) the tied aliases retain
+// Go's randomised map-iteration order, so a specific-order assertion FAILs
+// (§11.4.115 RED-on-broken-artifact); post-fix the Name tie-break makes the order
+// total + deterministic regardless of map iteration, so it PASSes (§11.4.50).
+func TestSnapshotDeterministicTieBreak(t *testing.T) {
+	r := NewRegistry()
+	// Registered in DESCENDING name order; all four primary keys are identical,
+	// so registration order is irrelevant and only Name can break the tie.
+	for _, n := range []string{"h", "g", "f", "e", "d", "c", "b", "a"} {
+		if err := r.Register(Alias{Name: n, Class: ClassNative, CapabilityRank: 0, StableIndex: 0}); err != nil {
+			t.Fatalf("Register %q: %v", n, err)
+		}
+	}
+	want := []string{"a", "b", "c", "d", "e", "f", "g", "h"} // name-ascending tie-break
+
+	const iters = 32
+	var firstOrder []string
+	for iter := 0; iter < iters; iter++ {
+		snap := r.Snapshot()
+		got := make([]string, len(snap))
+		for i, a := range snap {
+			got[i] = a.Name
+		}
+		// (a) specific-order assertion — the pre-fix code cannot guarantee this.
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("iter %d: order[%d] = %q; want name-ascending %q (full: %v)", iter, i, got[i], want[i], got)
+			}
+		}
+		// (b) byte-identical-across-iterations assertion — the determinism claim.
+		if firstOrder == nil {
+			firstOrder = got
+			continue
+		}
+		for i := range firstOrder {
+			if got[i] != firstOrder[i] {
+				t.Fatalf("iter %d nondeterministic at %d: %q vs first-run %q", iter, i, got[i], firstOrder[i])
+			}
+		}
+	}
+}
+
+// TestFirstOperableNilProbe proves a nil probe func is a clean ("",false) outcome,
+// never a panic (the reviewer's MINOR guard).
+func TestFirstOperableNilProbe(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(Alias{Name: "n", Class: ClassNative}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	name, ok := r.FirstOperable(t0, nil)
+	if ok || name != "" {
+		t.Fatalf("nil probe = (%q,%v); want (\"\",false)", name, ok)
+	}
+}
