@@ -1,0 +1,35 @@
+# Go build artefacts (regeneratable — never version-controlled)
+/bin/
+/build/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.o
+*.a
+coverage.out
+coverage.html
+
+# Go workspace / module cache
+/vendor/
+go.work
+go.work.sum
+
+# Secrets — NEVER commit (this repo is public)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Editor / OS state
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

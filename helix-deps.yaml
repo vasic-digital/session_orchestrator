@@ -1,0 +1,13 @@
+# §11.4.31 machine-readable dependency manifest.
+#
+# The engine adds NO new own-org submodule (nested own-org chains are FORBIDDEN,
+# §11.4.28). It reuses primitives that live in the constitution submodule and are
+# reached from a consumer's project root BY REFERENCE (§11.4.80/§11.4.109 pattern).
+# The current increment (the alias-health registry + is_operable predicate) has
+# ZERO external dependencies — it is pure Go stdlib.
+schema_version: 1
+deps: []
+transitive_handling:
+  recursive: true
+  conflict_resolution: operator-required
+language_specific_subtree: false
