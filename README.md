@@ -1,7 +1,7 @@
 # session_orchestrator
 
-**Revision:** 1
-**Last modified:** 2026-07-08T00:00:00Z
+**Revision:** 2
+**Last modified:** 2026-07-08T06:55:46Z
 **License:** MIT
 **Status:** early scaffold — buildable increments: the alias-health registry + `is_operable` predicate, the flowing-pool claim registry (exactly-once, deadlock-free, single-owner), and the non-failover scheduler (assignment/placement). The same-session failover/resume spine is **NOT** implemented (its cross-config-dir `claude --resume` continuity premise is `UNCONFIRMED:` pending a POC).
 
