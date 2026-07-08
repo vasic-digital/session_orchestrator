@@ -3,9 +3,10 @@
 # The engine adds NO new own-org submodule (nested own-org chains are FORBIDDEN,
 # §11.4.28). It reuses primitives that live in the constitution submodule and are
 # reached from a consumer's project root BY REFERENCE (§11.4.80/§11.4.109 pattern).
-# The current increments (the alias-health registry + is_operable predicate, and
-# the flowing-pool claim registry — exactly-once + deadlock-free single-owner
-# assignment, §11.4.176) have ZERO external dependencies — pure Go stdlib.
+# The current increments (the alias-health registry + is_operable predicate, the
+# flowing-pool claim registry — exactly-once + deadlock-free single-owner
+# assignment, §11.4.176 — and the non-failover scheduler that composes them into
+# the WS-D §4 placement pass) have ZERO external dependencies — pure Go stdlib.
 schema_version: 1
 deps: []
 transitive_handling:

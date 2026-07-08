@@ -3,7 +3,7 @@
 **Revision:** 1
 **Last modified:** 2026-07-08T00:00:00Z
 **License:** MIT
-**Status:** early scaffold — first buildable increment (the alias-health registry + `is_operable` predicate). The same-session failover/resume spine is **NOT** implemented (its cross-config-dir `claude --resume` continuity premise is `UNCONFIRMED:` pending a POC).
+**Status:** early scaffold — buildable increments: the alias-health registry + `is_operable` predicate, the flowing-pool claim registry (exactly-once, deadlock-free, single-owner), and the non-failover scheduler (assignment/placement). The same-session failover/resume spine is **NOT** implemented (its cross-config-dir `claude --resume` continuity premise is `UNCONFIRMED:` pending a POC).
 
 A **project-agnostic, fully decoupled** Go engine for coordinating a *flowing
 pool* of session aliases behind a *floating orchestrator role*, with a
@@ -39,6 +39,29 @@ The `alias` package:
   (native before provider, free before cooling, stronger before weaker, stable
   tie-break) and a first-operable selection that returns an explicit "none"
   rather than falling through to an unhealthy alias.
+
+The `claim` package:
+
+- **Registry** — the flowing-pool claim registry: an exactly-once,
+  deadlock-free, **single-owner** binding of an alias (one CLI credential/session
+  context) to at most one work-unit at a time. `TryClaim` is a non-blocking
+  atomic compare-and-set (GRANTED / GRANTED_EXISTING / DENIED); `Release`,
+  `Renew`, and TTL / dead-holder reaping keep the pool honest. Liveness is
+  proven, never assumed.
+
+The `scheduler` package:
+
+- **`Schedule`** — the **non-failover** assignment layer. Given a priority-ordered
+  set of work-units, the flowing alias pool, and the claim registry, it places
+  each work-unit onto the highest-priority **operable** alias by claiming it
+  exactly-once, so no two work-units ever share an alias (single-owner). It is a
+  pure composition of `alias.IsOperable` (fail-closed) + `claim.TryClaim` (atomic
+  single-owner CAS). A non-operable alias is **never** assigned; a work-unit with
+  no claimable operable alias is returned **explicitly Unassigned** (never
+  dropped, never double-assigned); a work-unit already holding a live claim keeps
+  it idempotently. The clock is injected, so assignment is deterministic. (The
+  re-homing of a degraded work-unit onto a new alias is the WS-C float — the
+  `UNCONFIRMED:` failover spine — and is deliberately **not** here.)
 
 ## Decoupling contract
 
