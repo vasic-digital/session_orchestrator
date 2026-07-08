@@ -63,6 +63,23 @@ The `scheduler` package:
   re-homing of a degraded work-unit onto a new alias is the WS-C float — the
   `UNCONFIRMED:` failover spine — and is deliberately **not** here.)
 
+The `supervisor` package:
+
+- **`Supervisor`** — the WS-D §2.3 **death-detection** watchdog. It monitors a
+  set of entities (the floating orchestrator role and/or pool aliases), each with
+  a consumer-supplied heartbeat/last-seen timestamp, and on each `Check(now)`
+  classifies every entity **ALIVE / SUSPECT / DEAD** from two evidence sources: the
+  heartbeat age against a configured liveness window, and an injectable liveness
+  proof. The proof is **authoritative in both directions** (mirroring the claim
+  registry): a proof of death declares DEAD even while the heartbeat is fresh; a
+  proof of life keeps the entity ALIVE even past the heartbeat window. It is a
+  **signal, not an action** — it emits an honest per-entity verdict + an
+  append-only transition log and returns the DEAD set, but performs **no** recovery
+  itself (reaping / re-homing is the caller's job). The clock is injected (`now` is
+  passed to every `Check`), so classification is deterministic. (The same-session
+  failover/resume spine it would trigger is the `UNCONFIRMED:` WS-C float and is
+  deliberately **not** here.)
+
 ## Decoupling contract
 
 This engine hardcodes **no** track, alias name, directory, threshold, or project
