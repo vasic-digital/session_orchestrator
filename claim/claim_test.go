@@ -432,3 +432,148 @@ func hasReap(events []Event, resource, reason string) bool {
 	}
 	return false
 }
+
+// TestLiveHolderPastTTLNotReaped is the SO-CLAIM-IMP-1 RED→GREEN guard
+// (§11.4.115): a holder that is PROVABLY ALIVE (injected Liveness reports true)
+// MUST NOT be reaped even after its TTL horizon elapses — reaping a running
+// session and re-granting its exclusive resource to a second work-unit is a
+// §9.2 / §11.4.176 single-owner break (two owners of one resource). RED on the
+// pre-fix code (staleReason reaped on now>=expiry unconditionally): the live
+// holder was reaped and wu-2 won GRANTED.
+func TestLiveHolderPastTTLNotReaped(t *testing.T) {
+	at := t0
+	r := New(Config{
+		Now:      fixedClock(&at),
+		NewID:    seqIDGen(),
+		Liveness: func(string) bool { return true }, // holder ALWAYS provably alive
+	})
+	first, out, _ := r.TryClaim("res", "wu-1", 10*time.Second)
+	if out != OutcomeGranted {
+		t.Fatalf("initial claim not granted: %q", out)
+	}
+
+	// Advance WELL past the TTL horizon. The holder is still provably alive, so
+	// the claim MUST survive — the TTL is not a hard cap while liveness holds.
+	at = t0.Add(time.Hour)
+
+	// A competing work-unit MUST be DENIED: the live holder still owns it.
+	c2, out, err := r.TryClaim("res", "wu-2", time.Hour)
+	if err != nil {
+		t.Fatalf("competitor claim errored: %v", err)
+	}
+	if out != OutcomeDenied || c2 != (Claim{}) {
+		t.Fatalf("live holder past TTL was reaped: competitor out=%q claim=%+v; want DENIED, {} (§9.2 single-owner)", out, c2)
+	}
+	if !r.IsClaimed("res") {
+		t.Fatal("live holder past TTL: IsClaimed=false; the claim was wrongly reaped")
+	}
+	// The live holder's own claim is unchanged and still the owner.
+	snap := r.Snapshot()
+	if len(snap) != 1 || snap[0].Holder != "wu-1" || snap[0].ClaimID != first.ClaimID {
+		t.Fatalf("live holder claim not preserved: %+v", snap)
+	}
+	// No REAP event may have fired for this live holder.
+	if hasReap(r.Events(), "res", reasonTTLElapsed) {
+		t.Fatal("a ttl_elapsed REAP fired for a provably-live holder (§9.2 violation)")
+	}
+}
+
+// TestPureTTLReapPreservedNoLiveness — (b): with NO Liveness proof configured,
+// a claim past its TTL IS reaped (pure-TTL fallback preserved). The fix must not
+// break the documented no-liveness lease.
+func TestPureTTLReapPreservedNoLiveness(t *testing.T) {
+	at := t0
+	r := New(Config{Now: fixedClock(&at), NewID: seqIDGen()}) // no Liveness
+	if _, out, _ := r.TryClaim("res", "wu-1", 10*time.Second); out != OutcomeGranted {
+		t.Fatalf("initial claim not granted")
+	}
+	// Within TTL: the reap sweep must NOT reap it.
+	at = t0.Add(5 * time.Second)
+	if got := r.Reap(); len(got) != 0 {
+		t.Fatalf("pre-expiry Reap reaped %d claims; want 0", len(got))
+	}
+	// Past TTL: the pure-TTL lease is reaped and reclaimable.
+	at = t0.Add(11 * time.Second)
+	c, out, _ := r.TryClaim("res", "wu-2", time.Hour)
+	if out != OutcomeGranted || c.Holder != "wu-2" {
+		t.Fatalf("pure-TTL past-expiry reclaim: out=%q holder=%q; want GRANTED wu-2", out, c.Holder)
+	}
+	if !hasReap(r.Events(), "res", reasonTTLElapsed) {
+		t.Fatal("no ttl_elapsed REAP event for the pure-TTL lease")
+	}
+}
+
+// TestDeadHolderReapedPastTTL — (c): with a Liveness proof, a claim past its TTL
+// whose holder is provably DEAD IS reaped (reason holder_dead — evidence-accurate).
+func TestDeadHolderReapedPastTTL(t *testing.T) {
+	at := t0
+	dead := map[string]bool{}
+	r := New(Config{
+		Now:      fixedClock(&at),
+		NewID:    seqIDGen(),
+		Liveness: func(h string) bool { return !dead[h] },
+	})
+	r.TryClaim("res", "wu-1", 10*time.Second)
+
+	// Advance past TTL AND mark the holder dead → provably reclaimable.
+	at = t0.Add(time.Hour)
+	dead["wu-1"] = true
+	c, out, _ := r.TryClaim("res", "wu-2", time.Hour)
+	if out != OutcomeGranted || c.Holder != "wu-2" {
+		t.Fatalf("dead-holder past-TTL reclaim: out=%q holder=%q; want GRANTED wu-2", out, c.Holder)
+	}
+	if !hasReap(r.Events(), "res", reasonHolderDead) {
+		t.Fatal("no holder_dead REAP event for the dead holder past TTL")
+	}
+}
+
+// TestRenewExtendsWindow — (d): Renew resets the TTL horizon so a pure-TTL claim
+// survives past its ORIGINAL expiry; a competitor is DENIED inside the renewed
+// window and GRANTED only once the renewed window lapses. Renew also requires the
+// matching claim id (§9.2) and records a RENEW event.
+func TestRenewExtendsWindow(t *testing.T) {
+	at := t0
+	r := New(Config{Now: fixedClock(&at), NewID: seqIDGen()}) // pure-TTL lease
+	c, _, _ := r.TryClaim("res", "wu-1", 10*time.Second)      // expiry = t0+10s
+
+	// Wrong claim id is rejected (§9.2).
+	if _, err := r.Renew("res", "wrong-id"); !errors.Is(err, ErrClaimMismatch) {
+		t.Fatalf("Renew with wrong id: got %v; want ErrClaimMismatch", err)
+	}
+	// Renew before expiry: new expiry = t0+5s+10s = t0+15s.
+	at = t0.Add(5 * time.Second)
+	rc, err := r.Renew("res", c.ClaimID)
+	if err != nil || rc.ClaimID != c.ClaimID {
+		t.Fatalf("Renew: claim=%+v err=%v; want same id, nil", rc, err)
+	}
+
+	// t0+12s is PAST the original expiry (10s) but INSIDE the renewed window (15s):
+	// the claim must survive → competitor DENIED. On an un-renewed claim this
+	// would have been reaped and GRANTED.
+	at = t0.Add(12 * time.Second)
+	if _, out, _ := r.TryClaim("res", "wu-2", time.Hour); out != OutcomeDenied {
+		t.Fatalf("inside renewed window: out=%q; want DENIED (Renew did not extend)", out)
+	}
+
+	// Past the renewed window → the lease lapses. A lapsed pure-TTL lease cannot
+	// be renewed (§9.2 — reap-first makes it read ErrNotClaimed, never resurrected).
+	at = t0.Add(16 * time.Second)
+	if _, err := r.Renew("res", c.ClaimID); !errors.Is(err, ErrNotClaimed) {
+		t.Fatalf("Renew of lapsed lease: got %v; want ErrNotClaimed", err)
+	}
+	// And it is reclaimable by a competitor.
+	if _, out, _ := r.TryClaim("res", "wu-2", time.Hour); out != OutcomeGranted {
+		t.Fatalf("past renewed window: out=%q; want GRANTED", out)
+	}
+
+	// A RENEW event was recorded for the original claim.
+	sawRenew := false
+	for _, e := range r.Events() {
+		if e.Kind == EventRenew && e.ResourceID == "res" && e.ClaimID == c.ClaimID {
+			sawRenew = true
+		}
+	}
+	if !sawRenew {
+		t.Fatal("no RENEW event recorded")
+	}
+}

@@ -17,13 +17,21 @@
 // `/mnt/trackN`, `claude1..N`, or any project asset, and it holds NO credential
 // material (§11.4.10) — only the observable claim bookkeeping.
 //
-// Anti-bluff contract (§11.4.6 / §11.4.176): "the TTL elapsed" and "the holder
-// is dead" are decided from evidence, never guessed. A claim is reaped ONLY when
-// now >= its expiry (TTL elapsed against the injected clock) OR the injected
-// Liveness proof reports the holder provably dead. A live-held claim is NEVER
-// reaped (§9.2 — reaping a running session would cross-contaminate it). When no
-// Liveness proof is supplied, a claim can be reaped by TTL alone — absence of a
-// liveness proof never becomes "assume dead".
+// Anti-bluff contract (§11.4.6 / §11.4.176 / WS-D DESIGN §1.4#3): "the TTL
+// elapsed" and "the holder is dead" are decided from evidence, never guessed. A
+// claim is reaped ONLY when the holder is provably reclaimable:
+//   - When a Liveness proof is supplied it is authoritative: the claim is reaped
+//     when (and only when) that proof reports the holder provably DEAD. A
+//     provably-ALIVE holder is NEVER reaped, EVEN PAST ITS TTL — reaping a
+//     running session would cross-contaminate it and hand its exclusive resource
+//     to a second owner (§9.2). The live proof is the "heartbeat"; the holder
+//     extends the TTL window explicitly via Renew.
+//   - When NO Liveness proof is supplied it is a pure-TTL lease: liveness cannot
+//     be proven, so the claim is reaped once now >= its expiry (the documented
+//     fallback). Such a holder MUST Renew before expiry to keep the claim.
+//
+// Absence of a liveness proof never becomes "assume dead"; presence of a live
+// proof never becomes "reap on TTL anyway".
 //
 // Scope boundary (§11.4.6): this registry is the claim spine only. The
 // same-session orchestrator failover/resume protocol (WS-D §2) is UNCONFIRMED /
@@ -79,7 +87,10 @@ const (
 	// OutcomeGranted — the resource was free and is now claimed by the caller.
 	OutcomeGranted Outcome = "GRANTED"
 	// OutcomeGrantedExisting — the caller already held a live claim on the
-	// resource; the existing claim is returned unchanged (exactly-once idempotency).
+	// resource; the existing claim is returned UNCHANGED (exactly-once
+	// idempotency). Re-claiming does NOT refresh the TTL window — a holder keeping
+	// a long-lived claim alive MUST call Renew (or supply a Liveness proof, which
+	// keeps the claim alive implicitly while the holder is provably alive).
 	OutcomeGrantedExisting Outcome = "GRANTED_EXISTING"
 	// OutcomeDenied — the resource is live-claimed by a DIFFERENT holder; a
 	// clean rejection (never an error, never a block).
@@ -94,6 +105,7 @@ const (
 	EventGrantExisting EventKind = "GRANT_EXISTING"
 	EventDeny          EventKind = "DENY"
 	EventRelease       EventKind = "RELEASE"
+	EventRenew         EventKind = "RENEW"
 	EventReap          EventKind = "REAP"
 )
 
@@ -251,6 +263,42 @@ func (r *Registry) Release(resourceID, claimID string) error {
 	return nil
 }
 
+// Renew is the explicit heartbeat: it extends the TTL window of the live claim on
+// resourceID by resetting GrantedAt to now, so the claim survives past its
+// original expiry. It is the documented way a holder keeps a long-lived claim
+// alive under the pure-TTL lease (no Liveness proof configured); with a Liveness
+// proof the claim is already kept alive implicitly while the holder is provably
+// alive, and Renew simply re-anchors the horizon.
+//
+// Like Release, the caller MUST pass the claim id it was granted: a mismatched id
+// is rejected (ErrClaimMismatch) so a stale holder cannot renew a claim that has
+// since been reaped and re-granted to a different holder (§9.2). Stale claims are
+// reaped BEFORE the lookup, so a pure-TTL lease that already lapsed reads as
+// ErrNotClaimed — a holder MUST renew before expiry; a lapsed lease is never
+// silently resurrected (§9.2 / §11.4.176). The renewed claim is returned.
+func (r *Registry) Renew(resourceID, claimID string) (Claim, error) {
+	if resourceID == "" {
+		return Claim{}, ErrEmptyResourceID
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	r.reapStaleLocked(now)
+	c, held := r.claims[resourceID]
+	if !held {
+		return Claim{}, ErrNotClaimed
+	}
+	if c.ClaimID != claimID {
+		return Claim{}, ErrClaimMismatch
+	}
+	c.GrantedAt = now
+	r.claims[resourceID] = c
+	r.events = append(r.events, Event{
+		At: now, Kind: EventRenew, ResourceID: resourceID, Holder: c.Holder, ClaimID: c.ClaimID,
+	})
+	return c, nil
+}
+
 // IsClaimed reports whether resourceID currently holds a live claim, reaping any
 // stale claim first so an expired/dead-holder resource reads as free.
 func (r *Registry) IsClaimed(resourceID string) bool {
@@ -300,14 +348,31 @@ func (r *Registry) reapStaleLocked(now time.Time) []Claim {
 }
 
 // staleReason decides, from evidence, whether a claim is reapable and why
-// (§11.4.6). TTL-elapsed is checked first; dead-holder only when a Liveness
-// proof was supplied. A live-held, non-expired claim is never stale.
+// (§11.4.6 / SO-CLAIM-IMP-1 / WS-D DESIGN §1.4#3: reap on "TTL elapsed WITH NO
+// HEARTBEAT", never on TTL alone while the holder is provably alive).
+//
+//   - With a Liveness proof configured the proof is authoritative at ALL times:
+//     a provably-DEAD holder is reaped (reason holder_dead) whether before OR
+//     after expiry (the fast-path reclaim, preserved), and a provably-ALIVE
+//     holder is NEVER reaped, EVEN PAST ITS TTL — reaping a running session and
+//     re-granting its exclusive resource to a second work-unit would be a §9.2 /
+//     §11.4.176 single-owner break. The live proof IS the heartbeat; the holder
+//     extends the window explicitly via Renew.
+//   - With NO Liveness proof (pure-TTL lease) liveness cannot be proven, so the
+//     claim is reaped once its TTL horizon elapses (reason ttl_elapsed) — the
+//     documented fallback. Such a holder MUST Renew before expiry to keep it.
 func (r *Registry) staleReason(c Claim, now time.Time) (string, bool) {
+	if r.alive != nil {
+		// Liveness is authoritative: dead → reap (any time); alive → never reap,
+		// even past TTL. Absence of proof-of-death is never "assume dead" (§11.4.6).
+		if !r.alive(c.Holder) {
+			return reasonHolderDead, true
+		}
+		return "", false
+	}
+	// Pure-TTL lease: no liveness proof → reap once the TTL horizon elapses.
 	if !now.Before(c.ExpiresAt()) { // now >= expiry
 		return reasonTTLElapsed, true
-	}
-	if r.alive != nil && !r.alive(c.Holder) {
-		return reasonHolderDead, true
 	}
 	return "", false
 }
