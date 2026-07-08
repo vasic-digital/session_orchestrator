@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"os"
 	"reflect"
 	"sync"
 	"testing"
@@ -440,6 +441,83 @@ func TestScheduleValidation(t *testing.T) {
 	}
 	if len(res.Placements) != 0 || len(res.Assigned) != 0 || len(res.Unassigned) != 0 {
 		t.Fatalf("empty pass produced work: %+v", res)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// (e) ATM-680 — the candidate ordering follows the INJECTED clock, not the wall
+// clock (§11.4.50 determinism). §11.4.115 RED→GREEN with a RED_MODE polarity
+// switch.
+//
+// Two operable native aliases share every priority key EXCEPT their cooldown
+// state at the wall clock:
+//
+//   - "aaa-cooldown": ExhaustedUntil = realNow+1h, StableIndex 0.
+//     At the WALL clock (≈realNow) it is still in cooldown → exhaustion_rank 1.
+//     At the INJECTED clock (realNow+48h) its cooldown has elapsed →
+//     exhaustion_rank 0.
+//   - "bbb-free": never in cooldown, StableIndex 1 → exhaustion_rank 0 always.
+//
+// Both are OPERABLE at the injected clock (both cooldowns elapsed, healthy probe),
+// so exactly one is claimed. The ONLY thing that decides WHICH one is the sort
+// clock of the candidate list:
+//
+//   - Injected-clock sort (CORRECT): both rank 0 → StableIndex tie-break →
+//     "aaa-cooldown" (index 0) sorts first → it is claimed.
+//   - Wall-clock sort (the ATM-680 DEFECT): "aaa-cooldown" is still exhausted
+//     (rank 1) so it sorts AFTER "bbb-free" (rank 0) → "bbb-free" is claimed.
+//
+// The operability filter itself already uses the injected clock, so both aliases
+// pass it identically in either code path — this test isolates EXACTLY the
+// candidate-sort clock source. Cooldown horizons are computed relative to
+// time.Now() so the divergence holds whenever the test runs.
+//
+// RED_MODE=1 reproduces-and-asserts-the-defect on the PRE-FIX artifact (expects
+// "bbb-free"); default RED_MODE=0 is the GREEN regression guard (expects
+// "aaa-cooldown"). Pre-fix: RED_MODE=0 FAILs (RED captured) while RED_MODE=1
+// PASSes (defect genuinely present). Post-fix: RED_MODE=0 PASSes (GREEN) while
+// RED_MODE=1 FAILs (defect gone).
+// -----------------------------------------------------------------------------
+
+func TestScheduleCandidateSortUsesInjectedClock(t *testing.T) {
+	redMode := os.Getenv("RED_MODE") == "1"
+
+	realNow := time.Now()
+	cooldownEnd := realNow.Add(time.Hour)   // at wall clock, aaa-cooldown is STILL exhausted
+	injected := realNow.Add(48 * time.Hour) // far past cooldownEnd → aaa-cooldown is FREE here
+
+	reg := regWith(t,
+		// aaa-cooldown: lower StableIndex (would win a rank-0 tie) but wall-clock exhausted.
+		alias.Alias{Name: "aaa-cooldown", Class: alias.ClassNative, CapabilityRank: 0, StableIndex: 0, ExhaustedUntil: cooldownEnd},
+		// bbb-free: never in cooldown, higher StableIndex.
+		alias.Alias{Name: "bbb-free", Class: alias.ClassNative, CapabilityRank: 0, StableIndex: 1},
+	)
+	injectedClock := func() time.Time { return injected }
+	cr := claim.New(claim.Config{Now: injectedClock})
+	cfg := Config{Now: injectedClock, Probe: allHealthy, TTL: time.Hour}
+
+	res, err := Schedule(reg, cr, []string{"wu"}, cfg)
+	if err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	p := res.Placements[0]
+	if !p.Assigned {
+		t.Fatalf("wu was not assigned (%+v); both aliases are operable at the injected clock", p)
+	}
+
+	if redMode {
+		// PRE-FIX defect reproduction: the wall-clock candidate sort leaves
+		// aaa-cooldown ranked exhausted, so bbb-free is picked.
+		if p.Alias != "bbb-free" {
+			t.Fatalf("RED_MODE: expected the ATM-680 wall-clock-sort defect (pick bbb-free); got %q — defect not reproduced", p.Alias)
+		}
+		return
+	}
+	// GREEN guard: the candidate sort MUST use the injected clock, at which
+	// aaa-cooldown is free and wins the StableIndex tie-break.
+	if p.Alias != "aaa-cooldown" {
+		t.Fatalf("candidate sort did not follow the injected clock: picked %q, want aaa-cooldown "+
+			"(the wall-clock exhaustion_rank leaked into the ordering — ATM-680)", p.Alias)
 	}
 }
 

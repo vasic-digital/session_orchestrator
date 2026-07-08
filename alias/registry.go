@@ -108,15 +108,27 @@ func (r *Registry) Names() []string {
 }
 
 // Snapshot returns a copy of every registered alias, ordered by the WS-B §3.1
-// priority key. It never mutates the registry.
+// priority key using the current wall clock for the exhaustion factor. It never
+// mutates the registry. A caller that injects its own clock (the scheduler's
+// cfg.Now) MUST use SnapshotAt so the candidate order is deterministic under
+// that clock rather than the wall clock (§11.4.50 — ATM-680).
 func (r *Registry) Snapshot() []Alias {
+	return r.SnapshotAt(time.Now())
+}
+
+// SnapshotAt is Snapshot with an explicit clock: it orders the returned aliases
+// by the WS-B §3.1 priority key using now for the exhaustion factor (the same
+// clock the operability check uses), so a caller that injects its own clock gets
+// a candidate order that is fully deterministic under that clock rather than the
+// wall clock (§11.4.50). It never mutates the registry.
+func (r *Registry) SnapshotAt(now time.Time) []Alias {
 	r.mu.RLock()
 	out := make([]Alias, 0, len(r.aliases))
 	for _, a := range r.aliases {
 		out = append(out, a)
 	}
 	r.mu.RUnlock()
-	SortByPriority(out)
+	SortByPriorityAt(out, now)
 	return out
 }
 
@@ -175,7 +187,10 @@ func (r *Registry) FirstOperable(now time.Time, probe func(Alias) ProbeResult) (
 	if probe == nil {
 		return "", false // no probe → nothing can be proven operable (never a panic)
 	}
-	for _, a := range r.Snapshot() {
+	// Order the candidates by the SAME injected clock the operability check uses,
+	// so selection is deterministic under that clock, not the wall clock (§11.4.50
+	// — ATM-680).
+	for _, a := range r.SnapshotAt(now) {
 		if IsOperable(a, probe(a), now) {
 			return a.Name, true
 		}

@@ -21,11 +21,17 @@ import (
 // here may lose the subsequent TryClaim to a concurrent claimant and get DENIED
 // — the caller then re-selects). Returns ("", false) when no alias qualifies —
 // an explicit, honest outcome (§11.4.6), never a bluffed assignment.
+//
+// The candidate ORDER is taken from reg.SnapshotAt(now) — the SAME injected clock
+// the operability check uses — so both the exhaustion-rank sort and the cooldown
+// check see one consistent instant and the candidate ordering is fully
+// deterministic under an injected clock, never the wall clock (§11.4.50 —
+// ATM-680).
 func FirstOperableUnclaimed(reg *alias.Registry, cr *Registry, now time.Time, probe func(alias.Alias) alias.ProbeResult) (string, bool) {
 	if reg == nil || cr == nil || probe == nil {
 		return "", false
 	}
-	for _, a := range reg.Snapshot() {
+	for _, a := range reg.SnapshotAt(now) {
 		if cr.IsClaimed(a.Name) {
 			continue // single-owner: already claimed by a work-unit (P1)
 		}
