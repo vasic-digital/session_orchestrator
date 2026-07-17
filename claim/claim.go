@@ -297,6 +297,7 @@ func (r *Registry) Renew(resourceID, claimID string) (Claim, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.trimEventsLocked()
 	now := r.now()
 	r.reapStaleLocked(now)
 	c, held := r.claims[resourceID]
@@ -311,7 +312,6 @@ func (r *Registry) Renew(resourceID, claimID string) (Claim, error) {
 	r.events = append(r.events, Event{
 		At: now, Kind: EventRenew, ResourceID: resourceID, Holder: c.Holder, ClaimID: c.ClaimID,
 	})
-		r.trimEventsLocked()
 	return c, nil
 }
 
