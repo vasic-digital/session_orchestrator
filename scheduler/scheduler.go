@@ -217,14 +217,11 @@ func placeOne(reg *alias.Registry, cr *claim.Registry, wu string, at time.Time, 
 	return Placement{WorkUnit: wu}
 }
 
-// heldBy returns the live claim a work-unit already owns, if any. cr.Snapshot
-// reaps stale claims first, so an expired/dead-holder claim reads as absent —
-// only a genuinely-live claim is honored (§11.4.6 evidence, never assumed).
+// heldBy returns the live claim a work-unit already owns, if any. Uses the
+// O(1) ClaimByHolder reverse-index lookup (holderIndex map) instead of the
+// O(n) Snapshot-based scan for faster scheduling with many aliases (§11.4.141).
+// ClaimByHolder reaps stale claims first, so an expired/dead-holder claim
+// reads as absent — only a genuinely-live claim is honored (§11.4.6).
 func heldBy(cr *claim.Registry, wu string) (claim.Claim, bool) {
-	for _, c := range cr.Snapshot() {
-		if c.Holder == wu {
-			return c, true
-		}
-	}
-	return claim.Claim{}, false
+	return cr.ClaimByHolder(wu)
 }

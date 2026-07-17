@@ -150,26 +150,34 @@ type Config struct {
 	Liveness Liveness
 }
 
+// maxEvents caps the in-memory event log. When the log exceeds this size, the
+// oldest events are trimmed. This prevents unbounded memory growth in
+// long-running orchestrators (the audit spine is append-only on disk via
+// WriteStatus; the in-memory log is a recent-window convenience).
+const maxEvents = 10000
+
 // Registry is the concurrency-safe claim registry. At most one live claim exists
 // per resource id (invariant P1 / §11.4.119). Every mutating decision is made
 // under a single lock held only for the in-memory compare-and-set + reap — never
 // across file I/O or any injected callback that could block.
 type Registry struct {
-	mu     sync.Mutex
-	claims map[string]Claim
-	events []Event
-	now    Clock
-	newID  IDGen
-	alive  Liveness
+	mu          sync.Mutex
+	claims      map[string]Claim
+	holderIndex map[string]string // holder → resourceID (reverse index for O(1) lookups)
+	events      []Event
+	now         Clock
+	newID       IDGen
+	alive       Liveness
 }
 
 // New returns an empty registry ready for concurrent use.
 func New(cfg Config) *Registry {
 	r := &Registry{
-		claims: make(map[string]Claim),
-		now:    cfg.Now,
-		newID:  cfg.NewID,
-		alive:  cfg.Liveness,
+		claims:      make(map[string]Claim),
+		holderIndex: make(map[string]string),
+		now:         cfg.Now,
+		newID:       cfg.NewID,
+		alive:       cfg.Liveness,
 	}
 	if r.now == nil {
 		r.now = time.Now
@@ -213,6 +221,7 @@ func (r *Registry) TryClaim(resourceID, holder string, ttl time.Duration) (Claim
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.trimEventsLocked()
 	now := r.now()
 	r.reapStaleLocked(now)
 
@@ -222,17 +231,20 @@ func (r *Registry) TryClaim(resourceID, holder string, ttl time.Duration) (Claim
 				At: now, Kind: EventGrantExisting, ResourceID: resourceID,
 				Holder: holder, ClaimID: existing.ClaimID,
 			})
+		r.trimEventsLocked()
 			return existing, OutcomeGrantedExisting, nil
 		}
 		r.events = append(r.events, Event{
 			At: now, Kind: EventDeny, ResourceID: resourceID,
 			Holder: holder, Reason: reasonClaimedBy,
 		})
+		r.trimEventsLocked()
 		return Claim{}, OutcomeDenied, nil
 	}
 
 	c := Claim{ResourceID: resourceID, Holder: holder, ClaimID: r.newID(), GrantedAt: now, TTL: ttl}
 	r.claims[resourceID] = c
+	r.holderIndex[holder] = resourceID
 	r.events = append(r.events, Event{
 		At: now, Kind: EventGrant, ResourceID: resourceID, Holder: c.Holder, ClaimID: c.ClaimID,
 	})
@@ -249,6 +261,7 @@ func (r *Registry) Release(resourceID, claimID string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.trimEventsLocked()
 	c, held := r.claims[resourceID]
 	if !held {
 		return ErrNotClaimed
@@ -257,9 +270,11 @@ func (r *Registry) Release(resourceID, claimID string) error {
 		return ErrClaimMismatch
 	}
 	delete(r.claims, resourceID)
+	delete(r.holderIndex, c.Holder)
 	r.events = append(r.events, Event{
 		At: r.now(), Kind: EventRelease, ResourceID: resourceID, Holder: c.Holder, ClaimID: c.ClaimID,
 	})
+		r.trimEventsLocked()
 	return nil
 }
 
@@ -296,6 +311,7 @@ func (r *Registry) Renew(resourceID, claimID string) (Claim, error) {
 	r.events = append(r.events, Event{
 		At: now, Kind: EventRenew, ResourceID: resourceID, Holder: c.Holder, ClaimID: c.ClaimID,
 	})
+		r.trimEventsLocked()
 	return c, nil
 }
 
@@ -307,6 +323,36 @@ func (r *Registry) IsClaimed(resourceID string) bool {
 	r.reapStaleLocked(r.now())
 	_, held := r.claims[resourceID]
 	return held
+}
+
+// ClaimByHolder returns the live claim held by the given holder, if any. It uses
+// the reverse index (holderIndex) for O(1) lookup, avoiding the O(n) linear scan
+// that Snapshot()-then-filter requires. Reaps stale claims first so an
+// expired/dead-holder claim reads as absent.
+func (r *Registry) ClaimByHolder(holder string) (Claim, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reapStaleLocked(r.now())
+	rid, ok := r.holderIndex[holder]
+	if !ok {
+		return Claim{}, false
+	}
+	c, held := r.claims[rid]
+	if !held {
+		// Stale index entry — clean up (should not happen after reap, but
+		// defensive per §11.4.6).
+		delete(r.holderIndex, holder)
+		return Claim{}, false
+	}
+	return c, true
+}
+
+// trimEventsLocked caps the in-memory event log at maxEvents, trimming the
+// oldest entries. Callers MUST hold r.mu.
+func (r *Registry) trimEventsLocked() {
+	if len(r.events) > maxEvents {
+		r.events = r.events[len(r.events)-maxEvents:]
+	}
 }
 
 // Reap sweeps every resource and reaps stale claims (TTL elapsed or holder
@@ -339,9 +385,11 @@ func (r *Registry) reapStaleLocked(now time.Time) []Claim {
 			continue
 		}
 		delete(r.claims, id)
+		delete(r.holderIndex, c.Holder)
 		r.events = append(r.events, Event{
 			At: now, Kind: EventReap, ResourceID: id, Holder: c.Holder, ClaimID: c.ClaimID, Reason: reason,
 		})
+		r.trimEventsLocked()
 		reaped = append(reaped, c)
 	}
 	return reaped
